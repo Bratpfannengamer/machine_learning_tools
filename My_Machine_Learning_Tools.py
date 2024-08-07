@@ -10,7 +10,7 @@ import pickle
 class LabelEncoder:
     """
     Eine Klasse, die verwendet wird, um eine Zuordnung von Labels zu numerischen Indizes und umgekehrt zu erstellen.
-    Dies ist nützlich für maschinelles Lernen und andere Anwendungen, bei denen kategorische Daten in eine numerische Form umgewandelt werden müssen.
+    Funktionen zum speichern, laden und erweitern ermöglichen konsistente Indizes über verschiedene Datensätze.
     """
 
     def __init__(self):
@@ -52,12 +52,17 @@ class LabelEncoder:
         Transformiert eine Liste von Indizes zurück in die ursprünglichen Labels.
         
         Parameters:
-        indices (list of int): Die Liste der Indizes, die zurücktransformiert werden sollen.
+        indices (list of int) oder torch.Tensor: Die Liste der Indizes oder Tensoren, die zurücktransformiert werden sollen.
         
         Returns:
-        list of str: Die Liste der entsprechenden Labels.
+        list of str oder torch.Tensor: Die Liste der entsprechenden Labels oder Tensoren.
         """
-        return [self.index_to_label[index] for index in indices]
+        if isinstance(indices, torch.Tensor):
+            indices = indices.tolist()
+        
+        labels = [self.index_to_label[index] for index in indices]
+        
+        return labels
     
     def transform_fit(self, labels):
         """
@@ -144,6 +149,86 @@ class LabelEncoder:
             'label_to_index': self.label_to_index,
             'index_to_label': self.index_to_label
         }
+
+class ZScoreEncoder:
+    def __init__(self):
+        self.params = {}
+
+    def fit(self, df, columns):
+        """
+        Berechnet den Mittelwert und die Standardabweichung der angegebenen Spalten.
+
+        Parameters:
+        df (pd.DataFrame): Der DataFrame, der die Daten enthält.
+        columns (list): Liste der Spaltennamen, die standardisiert werden sollen.
+
+        Returns:
+        None
+        """
+        for column in columns:
+            mean = df[column].mean()
+            std = df[column].std()
+            self.params[column] = {'mean': mean, 'std': std}
+
+    def transform(self, df):
+        """
+        Standardisiert die zuvor in `fit` angegebenen Spalten basierend auf den gespeicherten Mittelwerten und Standardabweichungen.
+
+        Parameters:
+        df (pd.DataFrame): Der DataFrame, der die Daten enthält.
+
+        Returns:
+        pd.DataFrame: Der DataFrame mit den standardisierten Spalten.
+        """
+        if not self.params:
+            raise ValueError("The encoder has not been fitted yet.")
+        for column, stats in self.params.items():
+            if column not in df.columns:
+                raise ValueError(f"The column '{column}' is not present in the DataFrame.")
+            mean = stats['mean']
+            std = stats['std']
+            df[column] = (df[column] - mean) / std
+        return df
+
+    def fit_transform(self, df, columns):
+        """
+        Berechnet den Mittelwert und die Standardabweichung und standardisiert die Spalten.
+
+        Parameters:
+        df (pd.DataFrame): Der DataFrame, der die Daten enthält.
+        columns (list): Liste der Spaltennamen, die standardisiert werden sollen.
+
+        Returns:
+        pd.DataFrame: Der DataFrame mit den standardisierten Spalten.
+        """
+        self.fit(df, columns)
+        return self.transform(df)
+
+    def save(self, file_path):
+        """
+        Speichert die Mittelwert- und Standardabweichungsparameter in einer Datei.
+
+        Parameters:
+        file_path (str): Der Pfad zur Datei, in der die Parameter gespeichert werden sollen.
+
+        Returns:
+        None
+        """
+        with open(file_path, 'wb') as f:
+            pickle.dump(self.params, f)
+
+    def load(self, file_path):
+        """
+        Lädt die Mittelwert- und Standardabweichungsparameter aus einer Datei.
+
+        Parameters:
+        file_path (str): Der Pfad zur Datei, aus der die Parameter geladen werden sollen.
+
+        Returns:
+        None
+        """
+        with open(file_path, 'rb') as f:
+            self.params = pickle.load(f)
 
 def df_unique_list_values(df, column):
     """
@@ -301,67 +386,280 @@ def _modelversions_get_model_path_with_version(model_path_base, version):
     """
     return f"{model_path_base}_v{version}.pt"
 
-def modelversions_save_model(model, model_path_base):
+def _modelversions_validate_save_params(mode,model_path_base,path):
     """
-    Speichert ein Modell und inkrementiert automatisch die Versionsnummer.
+    Validiert die Eingabeparameter für das Speichern eines Modells basierend auf dem angegebenen Modus.
+
+    Diese Funktion überprüft, ob die notwendigen Parameter für das Speichern eines Modells vorhanden und gültig sind, 
+    abhängig vom Modus, in dem das Modell gespeichert werden soll.
+    """
+    if mode in ['path'] and path is None:
+        print('Please enter a valid path')
+        return False
+    if mode in ['versions'] and model_path_base is None:
+        print('Please enter a valid model_path_base')
+        return False
+    return True
+
+def modelversions_save_model(model,optimizer, mode='versions', model_path_base=None, path=None, init_params=None):
+    """
+    Speichert ein Modell und seinen Optimiererzustand entweder an einem spezifischen Pfad oder mit einer automatisch inkrementierten Versionsnummer.
+    Es ist möglich das Modell auf Basis der Datei zu laden ohne Informationen über die Klasse und die Initialisierungsparameter zu haben.
+
+    Diese Funktion speichert das Modell und seinen Optimiererzustand zusammen mit den Modell- und Optimierer-Klasseninformationen 
+    und den Initialisierungsparametern. Je nach Modus wird das Modell entweder an einem angegebenen Pfad gespeichert oder die 
+    Versionsnummer wird automatisch erhöht und das Modell entsprechend gespeichert.
 
     Parameters:
-    model (torch.nn.Module): Das PyTorch-Modell, das gespeichert werden soll.
-    model_path_base (str): Der Basispfad, unter dem das Modell gespeichert werden soll. Die Versionsnummer wird automatisch angehängt.
+    model (torch.nn.Module): Das PyTorch-Modell, das gespeichert werden soll. 
+                             Das Modell sollte eine `state_dict`-Methode besitzen und seine Klasse sollte über eine
+                             `__class__`-Eigenschaft verfügen.
+                             
+    optimizer (torch.optim.Optimizer): Der Optimierer, dessen Zustand zusammen mit dem Modell gespeichert werden soll.
+
+    mode (str, optional): Der Modus, in dem das Modell gespeichert werden soll. Bestimmt, wie der Speicherpfad generiert wird.
+                          Mögliche Werte sind:
+                          - 'path': Ein vollständiger Pfad zum Modell wird verwendet.
+                          - 'versions': Die Versionsnummer des Modells wird automatisch inkrementiert.
+                          Standardwert ist 'versions'.
+
+    model_path_base (str, optional): Der Basis-Pfad, unter dem das Modell gespeichert werden soll. 
+                                     Erforderlich für den Modus 'versions'.
+
+    path (str, optional): Der vollständige Pfad zum Modell. 
+                          Erforderlich, wenn der Modus 'path' gewählt wird.
+
+    init_params (dict, optional): Initialisierungsparameter des Modells, die beim Erstellen des Modells verwendet wurden. 
+                                   Falls diese nicht angeben werden, wird angenommen, dass das Modell eine `init_params`-Eigenschaft hat.
 
     Returns:
-    None
+    None: Gibt `None` zurück, wenn der Speicherprozess aufgrund ungültiger Parameter abgebrochen wurde.
 
     Example:
-    >>> model = MyModel()
-    >>> modelversions_save_model(model, '/path/to/models/test')
-    Model saved as /path/to/models/test_v1.pt
+    >>> model = MultilingualBERTClassifier()
+    >>> optimizer = torch.optim.Adam(model.parameters())
+    >>> modelversions_save_model(model, optimizer, 'versions', model_path_base='/path/to/models')
+    Model saved as /path/to/models_model_v1.pt
+    
+    >>> modelversions_save_model(model, optimizer, 'path', path='/path/to/models/model_v1.pt')
+    Model saved as /path/to/models/model_v1.pt
     """
-    available_versions = _modelversions_get_available_versions(model_path_base)
-    new_version = (available_versions[-1] + 1) if available_versions else 1
-    model_path = _modelversions_get_model_path_with_version(model_path_base, new_version)
-    torch.save({'model_state_dict': model.state_dict()}, model_path)
+    if mode=='path':
+        if not _modelversions_validate_save_params(mode,model_path_base,path):
+            return None
+        model_path=path
+    elif mode=='versions':
+        if not _modelversions_validate_save_params(mode,model_path_base,path):
+            return None
+        available_versions = _modelversions_get_available_versions(model_path_base)
+        new_version = (available_versions[-1] + 1) if available_versions else 1
+        model_path = _modelversions_get_model_path_with_version(model_path_base, new_version)
+    else:
+        print('Please enter a valid mode')
+        return None
+    
+    if init_params is None:
+        init_params = model.init_params
+
+    torch.save({
+    'model_state_dict': model.state_dict(),
+    'optimizer_state_dict': optimizer.state_dict(),
+    'model_class': model.__class__,
+    'model_init_params': init_params
+    }, model_path)
     print(f"Model saved as {model_path}")
 
-
-def modelversions_load_model(model, model_path_base):
+def _modelversions_validate_load_params(mode,model_path_base,version,path):
     """
-    Lädt ein Modell aus einer spezifischen Version.
+    Validiert die Parameter für das Laden eines Modells basierend auf dem angegebenen Modus.
 
-    Parameters:
-    model (torch.nn.Module): Das PyTorch-Modell, das geladen werden soll.
-    model_path_base (str): Der Basispfad, unter dem das Modell gespeichert ist.
+    Diese Funktion überprüft die Gültigkeit der Eingabeparameter, die zum Laden eines Modells verwendet werden. 
+    Je nach Modus werden unterschiedliche Parameter überprüft, um sicherzustellen, dass alle erforderlichen 
+    Informationen bereitgestellt werden.
 
     Returns:
-    None
+    bool: Gibt `True` zurück, wenn alle erforderlichen Parameter vorhanden und gültig sind, andernfalls `False`.
+    """
+    if mode in ['path'] and path is None:
+        print('Please enter a valid path')
+        return False
+    if mode in ['version_fixed'] and version is None:
+        print('Please enter a valid version')
+        return False
+    if mode in ['version_fixed','version_selection','latest'] and model_path_base is None:
+        print('Please enter a valid model_path_base')
+        return False
+    return True
+
+def _modelversions_get_loadpath(mode,model_path_base,version,path):
+    """
+    Bestimmt den Pfad zum Modell basierend auf dem angegebenen Modus und den Eingabeparametern.
+
+    Diese Funktion verwendet den angegebenen Modus, um den richtigen Pfad zum Modell zu bestimmen, das geladen werden soll. 
+
+    Parameters:
+    mode (str): Der Modus, der angibt, wie das Modell geladen werden soll.
+
+    model_path_base (str, optional): Der Basis-Pfad, unter dem das Modell gespeichert ist. 
+                                     Dieser Parameter ist erforderlich für die Modi 'version_fixed', 'version_selection' und 'latest'.
+
+    version (int, optional): Die Version des Modells, die geladen werden soll. 
+                              Dieser Parameter ist erforderlich für den Modus 'version_fixed'.
+
+    path (str, optional): Der vollständige Pfad zum Modell. 
+                          Dieser Parameter ist erforderlich, wenn der Modus 'path' gewählt wurde.
+    """
+    if mode=='path':
+        if not _modelversions_validate_load_params(mode,model_path_base,version,path):
+            return None
+        model_path=path
+    elif mode=='version_fixed':
+        if not _modelversions_validate_load_params(mode,model_path_base,version,path):
+            return None
+        model_path_base = _modelversions_get_model_path_with_version(model_path_base, version)
+    elif mode=='version_selection':
+        if not _modelversions_validate_load_params(mode,model_path_base,version,path):
+            return None
+        available_versions = _modelversions_get_available_versions(model_path_base)
+        if available_versions:
+            while True:
+                try:
+                    version = int(input(f"Enter the version to load ({_modelversions_format_versions(available_versions)} or 0 to cancel): "))
+                    if version == 0:
+                        print("Loading cancelled.")
+                        return None
+                    elif version in available_versions:
+                        break
+                    else:
+                        print(f"Invalid version. Please enter a number out of {_modelversions_format_versions(available_versions)}, or 0 to cancel.")
+                except ValueError:
+                    print("Invalid input. Please enter a valid integer.")
+        else:
+            print("No versions available.")
+            return None
+        model_path = _modelversions_get_model_path_with_version(model_path_base, version)
+    elif mode=='latest':
+        if not _modelversions_validate_load_params(mode,model_path_base,version,path):
+            return None
+        available_versions = _modelversions_get_available_versions(model_path_base)
+        if available_versions:
+            version = available_versions[-1]
+            model_path = _modelversions_get_model_path_with_version(model_path_base, version)
+        else:
+            print("No versions available.")
+            return None
+    else:
+        print('Please enter a valid mode')
+        return None
+    return model_path
+
+
+def modelversions_load_model(mode='latest',model_path_base=None,version=None,path=None):
+    """
+    Lädt ein Modell aus einer bestimmten Version oder einem angegebenen Pfad basierend auf dem Modus.
+
+    Diese Funktion lädt ein gespeichertes Modell von einem bestimmten Pfad oder einer bestimmten Version, 
+    indem sie den richtigen Pfad zum Modell ermittelt und das Modell sowie die zugehörigen Zustandsdaten (State Dict) 
+    aus einer Datei lädt. Die Funktion erstellt eine Instanz des Modells mit den gespeicherten Initialisierungsparametern 
+    und stellt den Modellzustand wieder her.
+
+    Parameters:
+    mode (str): Der Modus, in dem das Modell geladen werden soll. Bestimmt, wie der Pfad zum Modell ermittelt wird.
+                Mögliche Werte sind:
+                - 'path': Ein vollständiger Pfad zum Modell wird verwendet.
+                - 'version_fixed': Eine spezifische Version des Modells wird verwendet.
+                - 'version_selection': Der Benutzer wird zur Auswahl einer Version aufgefordert.
+                - 'latest': Die neueste verfügbare Version des Modells wird verwendet.
+                Standardwert ist 'latest'.
+
+    model_path_base (str, optional): Der Basis-Pfad, unter dem das Modell gespeichert ist. 
+                                     Erforderlich für die Modi 'version_fixed', 'version_selection' und 'latest'.
+
+    version (int, optional): Die Version des Modells, die geladen werden soll. 
+                              Erforderlich für den Modus 'version_fixed'.
+
+    path (str, optional): Der vollständige Pfad zum Modell. 
+                          Erforderlich, wenn der Modus 'path' gewählt wird.
+
+    Returns:
+    torch.nn.Module: Das geladene Modell als Instanz der Modellklasse.
 
     Example:
-    >>> model = MyModel()
-    >>> load_model(model, '/path/to/models/test')
-    Available versions: [1, 2, 3]
-    Enter 0 to cancel.
-    Enter the version to load (1-3 or 0 to cancel): 2
-    Model loaded from /path/to/models/test_v2.pt
-    """
-    available_versions = _modelversions_get_available_versions(model_path_base)
-    if available_versions!=[]:
-        while True:
-            try:
-                version = int(input(f"Enter the version to load ({_modelversions_format_versions(available_versions)} or 0 to cancel): "))
-                if version == 0:
-                    print("Loading cancelled.")
-                    return
-                elif version in available_versions:
-                    break
-                else:
-                    print(f"Invalid version. Please enter a number out of {_modelversions_format_versions(available_versions)}, or 0 to cancel.")
-            except ValueError:
-                print("Invalid input. Please enter a valid integer.")
-    else:
-        print("No versions available.")
-        return
+    >>> model = modelversions_load_model('latest', model_path_base='/path/to/models')
+    Model loaded from /path/to/models_model_v{latest model}.pt
     
-    model_path = _modelversions_get_model_path_with_version(model_path_base, version)
+    >>> model = modelversions_load_model('version_fixed', model_path_base='/path/to/models', version=2)
+    Model loaded from /path/to/models_model_v2.pt
+    
+    >>> model = modelversions_load_model('path', path='/path/to/models/model.pt')
+    Model loaded from /path/to/models/model_v2.pt
+    """
+    model_path = _modelversions_get_loadpath(mode,model_path_base,version,path)
+    if model_path is None:
+        return None
     checkpoint = torch.load(model_path)
+    model_class = checkpoint['model_class']
+    model_init_params = checkpoint['model_init_params']
+    
+    # Initialisieren des Modells mit den gespeicherten Parametern
+    model = model_class(**model_init_params)
     model.load_state_dict(checkpoint['model_state_dict'])
     print(f"Model loaded from {model_path}")
+    return model
+
+
+
+
+def train_calculate_class_weights(labels, method='sqrt'):
+    """
+    Berechnet die Gewichte für die Klassen basierend auf der Häufigkeit der Labels und der angegebenen Methode.
+
+    Args:
+    labels (torch.Tensor): Tensor der Labels. Dies ist ein eindimensionaler Tensor, der die Klassenzugehörigkeit 
+                           jedes Beispiels enthält. Die Labels sollten ganzzahlige Werte sein.
+    method (str): Methode zur Berechnung der Gewichte. Es stehen drei Methoden zur Verfügung:
+                  'sqrt': Umgekehrt proportional zur Quadratwurzel der Klassenhäufigkeit.
+                  'log': Logarithmische Gewichtung basierend auf der Klassenhäufigkeit.
+                  'inverse': Umgekehrt proportional zur Klassenhäufigkeit.
+                  Der Standardwert ist 'sqrt'.
+
+    Returns:
+    torch.Tensor: Tensor der Klassen-Gewichte. Jeder Eintrag im Tensor repräsentiert das Gewicht der entsprechenden Klasse.
+                  Die Reihenfolge der Gewichte entspricht der Reihenfolge der eindeutigen Klassen, die in den Labels 
+                  vorhanden sind.
+    
+    Raises:
+    ValueError: Wenn die angegebene Methode nicht 'sqrt', 'log' oder 'inverse' ist.
+    
+    Beispiel:
+    >>> labels = torch.tensor([0, 1, 1, 2, 2, 2])
+    >>> calculate_class_weights(labels, method='inverse')
+    tensor([3.0000, 1.5000, 1.0000])
+    """
+
+    # Berechne die Häufigkeit jeder Klasse
+    unique_classes, class_counts = torch.unique(labels, return_counts=True)
+    
+    # Berechne die Gesamtzahl der Beispiele
+    total_samples = labels.size(0)
+    
+    if method == 'sqrt':
+        # Umgekehrt proportional zur Quadratwurzel der Klassenhäufigkeit
+        weights = torch.sqrt(total_samples / class_counts.float())
+    elif method == 'log':
+        # Logarithmische Gewichtung
+        weights = torch.log(1 + total_samples / class_counts.float())
+    elif method == 'inverse':
+        # Umgekehrt proportional zur Klassenhäufigkeit
+        weights = total_samples / class_counts.float()
+    else:
+        raise ValueError("Method must be 'sqrt', 'log', or 'inverse'")
+    
+    # Normalisierung (optional)
+    weights = weights / torch.sum(weights) * len(unique_classes)
+    
+    # Erstelle eine Gewichtungstabelle für alle möglichen Klassen
+    class_weights = torch.zeros(len(unique_classes), dtype=torch.float)
+    class_weights[unique_classes] = weights
+    
+    return class_weights  
